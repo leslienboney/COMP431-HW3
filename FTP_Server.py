@@ -3,160 +3,177 @@ import sys
 import os
 import shutil
 import socket
-from typing import Optional, Tuple
+
+CMD_USER = re.compile(r'^\s*USER\s+([^\r\n ]+)\r\n$', re.IGNORECASE)
+CMD_PASS = re.compile(r'^\s*PASS\s+([^\r\n ]+)\r\n$', re.IGNORECASE)
+CMD_TYPE = re.compile(r'^TYPE\s+([AI])\r\n$', re.IGNORECASE)
+CMD_RETR = re.compile(r'^RETR\s+(.+)\r\n$', re.IGNORECASE)
+CMD_PORT = re.compile(r'^PORT\s+(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\r\n$', re.IGNORECASE)
+CMD_SYST = re.compile(r'^SYST\r\n$', re.IGNORECASE)
+CMD_NOOP = re.compile(r'^NOOP\r\n$', re.IGNORECASE)
 
 
 class FTPServer:
     def __init__(self):
-        self.session_state = {
+        self.session = {
             'authenticated': False,
-            'user_received': False,
-            'data_port': None,
-            'client_addr': None,  # type: Optional[Tuple[str, int]]
-            'transfer_count': 0
+            'expect_password': False,
+            'data_ready': False,
+            'transfer_count': 0,
+            'client_address': None
         }
-        self.command_handlers = {
-            'USER': self.handle_user,
-            'PASS': self.handle_pass,
-            'TYPE': self.handle_type,
-            'SYST': self.handle_syst,
-            'NOOP': self.handle_noop,
-            'PORT': self.handle_port,
-            'RETR': self.handle_retr,
-            'QUIT': self.handle_quit
-        }
-        self.response_codes = {
-            'ready': '220 COMP 431 FTP server ready.\r\n',
-            'user_ok': '331 Guest access OK, send password.\r\n',
-            'login_ok': '230 Guest login OK.\r\n',
-            'syst_ok': '215 UNIX Type: L8.\r\n',
-            'type_ok': '200 Type set to {mode}.\r\n',
-            'port_ok': '200 Port command successful ({ip},{port}).\r\n',
-            'retr_ready': '150 File status okay.\r\n',
-            'retr_ok': '250 Requested file action completed.\r\n',
-            'quit_ok': '221 Goodbye.\r\n',
-            'bad_param': '501 Syntax error in parameter.\r\n',
-            'bad_seq': '503 Bad sequence of commands.\r\n',
-            'unauth': '530 Not logged in.\r\n',
-            'file_error': '550 File not found or access denied.\r\n',
-            'conn_error': '425 Can not open data connection.\r\n',
-            'unrecognized': '500 Syntax error, command unrecognized.\r\n'
-        }
-        os.makedirs('retr_files', exist_ok=True)
+        self.storage_dir = "downloaded_files"
+        os.makedirs(self.storage_dir, exist_ok=True)
 
-    def handle_user(self, cmd: str) -> str:
-        user_match = re.match(r'^\s*USER\s+(\S+)\r\n$', cmd, re.I)
-        if not user_match:
-            return self.response_codes['bad_param']
-        self.session_state.update({
+    def process_client_command(self, command_input, connection):
+        print(command_input, end="")
+
+        if command_input.startswith((' ', '\t')):
+            return "500 Syntax error, command unrecognized.\r\n"
+
+        if command_input.strip().upper() == 'QUIT\r\n':
+            return "221 Goodbye.\r\n"
+
+        command_parts = command_input.strip().split(maxsplit=1)
+        cmd_key = command_parts[0].upper() if command_parts else ""
+
+        handlers = {
+            'USER': self.handle_user_auth,
+            'PASS': self.handle_password,
+            'TYPE': self.handle_type_set,
+            'RETR': self.handle_file_transfer,
+            'PORT': self.handle_data_port,
+            'SYST': self.handle_system_info,
+            'NOOP': self.handle_noop
+        }
+
+        return handlers.get(cmd_key, lambda *_: "500 Syntax error, command unrecognized.\r\n")(command_input,
+                                                                                               connection)
+
+    def handle_user_auth(self, command, _):
+        auth_match = CMD_USER.match(command)
+        if not auth_match:
+            return "501 Syntax error in parameter.\r\n"
+
+        self.session.update({
+            'expect_password': True,
             'authenticated': False,
-            'user_received': True,
-            'data_port': None,
-            'client_addr': None
+            'data_ready': False
         })
-        return self.response_codes['user_ok']
+        return "331 Guest access OK, send password.\r\n"
 
-    def handle_port(self, cmd: str) -> str:
-        port_match = re.match(r'^PORT\s+(\d+,\d+,\d+,\d+,\d+,\d+)\r\n$', cmd, re.I)
+    def handle_password(self, command, _):
+        if not self.session['expect_password']:
+            return "503 Bad sequence of commands.\r\n"
+
+        pass_match = CMD_PASS.match(command)
+        if not pass_match:
+            return "501 Syntax error in parameter.\r\n"
+
+        self.session.update({
+            'authenticated': True,
+            'expect_password': False
+        })
+        return "230 Guest login OK.\r\n"
+
+    def handle_data_port(self, command, _):
+        port_match = CMD_PORT.match(command)
         if not port_match:
-            return self.response_codes['bad_param']
+            return "501 Syntax error in parameter.\r\n"
 
-        parts = list(map(int, port_match.group(1).split(',')))
-        if len(parts) != 6 or any(p < 0 or p > 255 for p in parts):
-            return self.response_codes['bad_param']
+        ip_components = list(map(int, port_match.groups()[:4]))
+        # Fixed port calculation with proper parentheses
+        port_number = (int(port_match.group(5)) * 256) + int(port_match.group(6))
 
-        ip = '.'.join(map(str, parts[:4]))
-        port = parts[4] * 256 + parts[5]
-        self.session_state['client_addr'] = (ip, port)
+        self.session['client_address'] = ('.'.join(map(str, ip_components)), port_number)
+        self.session['data_ready'] = True
 
-        return self.response_codes['port_ok'].format(
-            ip=ip,
-            port=port
-        )
+        # Fixed f-string with proper curly braces
+        return f"200 Port command successful ({self.session['client_address'][0]},{self.session['client_address'][1]}).\r\n"
 
-    def handle_retr(self, cmd: str, conn: socket.socket) -> str:
-        if not self.session_state['authenticated']:
-            return self.response_codes['unauth']
-        if not self.session_state['client_addr']:
-            return self.response_codes['bad_seq']
+    def handle_file_transfer(self, command, conn):
+        if not self.session['data_ready']:
+            return "503 Bad sequence of commands.\r\n"
 
-        retr_match = re.match(r'^RETR\s+(\S+)\r\n$', cmd, re.I)
-        if not retr_match:
-            return self.response_codes['bad_param']
+        file_match = CMD_RETR.match(command)
+        if not file_match or not os.path.isfile(file_match.group(1)):
+            return "550 File not found or access denied.\r\n"
 
-        file_path = retr_match.group(1)
-        if not os.path.isfile(file_path):
-            return self.response_codes['file_error']
-
-        conn.sendall(self.response_codes['retr_ready'].encode())
-        data_sock: Optional[socket.socket] = None
+        file_path = file_match.group(1)
+        conn.sendall("150 File status okay.\r\n".encode())
+        print("150 File status okay.\r\n", end="")
 
         try:
-            data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            data_sock.settimeout(10)
-            data_sock.connect(self.session_state['client_addr'])
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as data_sock:
+                data_sock.settimeout(10)
+                data_sock.connect(self.session['client_address'])
+                with open(file_path, 'rb') as file_stream:
+                    shutil.copyfileobj(file_stream, data_sock.makefile('wb'))
 
-            with open(file_path, 'rb') as f:
-                shutil.copyfileobj(f, data_sock.makefile('wb'))
-
-            self.session_state['transfer_count'] += 1
-            dest = os.path.join('retr_files', f'file{self.session_state["transfer_count"]}')
-            shutil.copy(file_path, dest)
-            return self.response_codes['retr_ok']
-
-        except (socket.error, OSError, TimeoutError):
-            return self.response_codes['conn_error']
+            self.session['transfer_count'] += 1
+            dest_file = os.path.join(self.storage_dir, f"file{self.session['transfer_count']}")
+            shutil.copy(file_path, dest_file)
+            return "250 Requested file action completed.\r\n"
+        except Exception:
+            return "425 Can not open data connection.\r\n"
         finally:
-            if data_sock:
-                data_sock.close()
-            self.session_state['client_addr'] = None
+            self.session['data_ready'] = False
 
-    def process_command(self, cmd: str, conn: socket.socket) -> str:
-        cmd_upper = cmd.strip().upper()
-        for prefix in self.command_handlers:
-            if cmd_upper.startswith(prefix):
-                handler = self.command_handlers[prefix]
-                if prefix == 'RETR':
-                    return handler(cmd, conn)
-                return handler(cmd)
-        return self.response_codes['unrecognized']
+    def handle_type_set(self, command, _):
+        type_match = CMD_TYPE.match(command)
+        if type_match:
+            return f"200 Type set to {type_match.group(1).upper()}.\r\n"
+        return "501 Syntax error in parameter.\r\n"
 
-    def run_server(self, port: int):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(('', port))
-            s.listen(1)
-            print(self.response_codes['ready'], end='')
+    def handle_system_info(self, command, _):
+        if CMD_SYST.match(command):
+            return "215 UNIX Type: L8.\r\n"
+        return "501 Syntax error in parameter.\r\n"
+
+    def handle_noop(self, command, _):
+        if CMD_NOOP.match(command):
+            return "200 Command OK.\r\n"
+        return "501 Syntax error in parameter.\r\n"
+
+    def start_service(self, service_port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(('', service_port))
+            listener.listen(1)
+            print("220 COMP 431 FTP server ready.\r\n", end="")
 
             while True:
-                conn, addr = s.accept()
-                try:
-                    conn.sendall(self.response_codes['ready'].encode())
-                    self.session_state = {
+                client_conn, client_addr = listener.accept()
+                with client_conn:
+                    client_conn.sendall(b"220 COMP 431 FTP server ready.\r\n")
+                    self.session = {
                         'authenticated': False,
-                        'user_received': False,
-                        'data_port': None,
-                        'client_addr': None,
-                        'transfer_count': 0
+                        'expect_password': False,
+                        'data_ready': False,
+                        'transfer_count': 0,
+                        'client_address': None
                     }
 
                     while True:
-                        data = conn.recv(1024).decode()
-                        if not data:
+                        try:
+                            incoming_data = client_conn.recv(1024).decode()
+                            if not incoming_data:
+                                break
+
+                            response = self.process_client_command(incoming_data, client_conn)
+                            print(response, end="")
+                            client_conn.sendall(response.encode())
+
+                            if incoming_data.strip().upper().startswith("QUIT"):
+                                break
+                        except Exception as e:
                             break
-                        print(data, end='')
-                        response = self.process_command(data, conn)
-                        print(response, end='')
-                        conn.sendall(response.encode())
-                        if data.strip().upper() == 'QUIT':
-                            break
-                finally:
-                    conn.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python ftpserver.py <port>")
+        print("Usage: python3 FTP_Server.py <port>")
         sys.exit(1)
-    server = FTPServer()
-    server.run_server(int(sys.argv[1]))
+
+    ftp_server = FTPServer()
+    ftp_server.start_service(int(sys.argv[1]))
