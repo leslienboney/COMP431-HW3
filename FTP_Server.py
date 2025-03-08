@@ -82,13 +82,11 @@ class FTPServer:
             return "501 Syntax error in parameter.\r\n"
 
         ip_components = list(map(int, port_match.groups()[:4]))
-        # Fixed port calculation with proper parentheses
         port_number = (int(port_match.group(5)) * 256) + int(port_match.group(6))
 
         self.session['client_address'] = ('.'.join(map(str, ip_components)), port_number)
         self.session['data_ready'] = True
 
-        # Fixed f-string with proper curly braces
         return f"200 Port command successful ({self.session['client_address'][0]},{self.session['client_address'][1]}).\r\n"
 
     def handle_file_transfer(self, command, conn):

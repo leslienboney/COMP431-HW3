@@ -37,7 +37,7 @@ class FTPClient:
             print(err)
             return
 
-        if self.control_sock:  # Close existing connection
+        if self.control_sock:
             self.send_quit()
 
         try:
