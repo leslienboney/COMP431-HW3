@@ -1,334 +1,396 @@
 import sys
 import os
 import socket
-import re
 
-char_map = {
+ASCII = {
     "A": ord("A"), "Z": ord("Z"),
     "a": ord("a"), "z": ord("z"),
     "0": ord("0"), "9": ord("9"),
-    "min_val": 0, "max_val": 127}
+    "min_ascii_val": 0, "max_ascii_val": 127}
 
 
-def execute_commands():
-    valid_actions = ["CONNECT"]
-    data_port = int(sys.argv[1])
-    control_channel = None
-    file_count = 0
+def read_commands():
+    expected_commands = ["CONNECT"]
 
-    for user_input in sys.stdin:
-        sys.stdout.write(user_input)
-        parts = user_input.strip().split()
-        if not parts:
+    welcoming_port = int(sys.argv[1])
+    ftp_control_connection = None
+    num_copied_files = 0
+
+
+
+
+    for command in sys.stdin:
+        sys.stdout.write(command)
+        tokens = command.split()
+        if len(tokens) == 0:
             continue
 
-        action = parts[0].upper()
-        if action not in valid_actions:
+        cmd_type = tokens[0].upper()
+        if cmd_type in expected_commands:
+            if cmd_type == "CONNECT":
+
+                output_msg, server_port, server_host = parse_connect(command)
+
+                if "ERROR" in output_msg:
+                    print(output_msg)
+                    continue
+
+                print(output_msg, end='')
+
+                if ftp_control_connection is not None:
+                    process_quit(ftp_control_connection)
+                    ftp_control_connection.close()
+                    ftp_control_connection = None
+
+                try:
+                    ftp_control_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    ftp_control_connection.connect((server_host, server_port))
+                except Exception as e:
+                    print("CONNECT failed")
+                    ftp_control_connection = None
+                    continue
+
+                welcoming_port = int(sys.argv[1])
+
+                reply = ftp_control_connection.recv(1024).decode()
+                parsed_reply, _ = parse_reply(reply)
+                print(parsed_reply, end='')
+
+                for cmd in generate_connect_output():
+                    sys.stdout.write(cmd)
+                    ftp_control_connection.sendall(cmd.encode())
+                    reply = ftp_control_connection.recv(1024).decode()
+                    parsed_reply, _ = parse_reply(reply)
+                    print(parsed_reply, end='')
+
+                expected_commands = ["CONNECT", "GET", "QUIT"]
+
+
+
+
+
+            elif cmd_type == "GET":
+                if ftp_control_connection is None:
+                    print("ERROR -- No FTP control connection established")
+                    continue
+                result = parse_get(command)
+                if isinstance(result, tuple):
+                    response, pathname = result
+                    print(response, end='')
+                else:
+                    print(result)
+                    continue
+                ftp_control_connection, welcoming_port, num_copied_files = process_get(
+                    ftp_control_connection, welcoming_port, tokens[1], num_copied_files)
+
+
+
+            elif cmd_type == "QUIT":
+                result = parse_quit(command)
+                print(result, end='')
+                process_quit(ftp_control_connection)
+                ftp_control_connection.close()
+                ftp_control_connection = None
+                sys.exit(0)
+        else:
             print("ERROR -- Command Unexpected/Unknown")
-            continue
 
-        if action == "CONNECT":
-            result_msg, port_num, hostname = check_connection(user_input)
-            if "ERROR" in result_msg:
-                print(result_msg)
-                continue
-            print(result_msg, end='')
-
-            if control_channel:
-                end_session(control_channel)
-                control_channel.close()
-                control_channel = None
-
-            try:
-                control_channel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                control_channel.connect((hostname, port_num))
-            except Exception:
-                print("CONNECT failed")
-                control_channel = None
-                continue
-
-            data_port = int(sys.argv[1])
-            response = control_channel.recv(1024).decode()
-            formatted_resp, _ = process_response(response)
-            print(formatted_resp, end='')
-
-            for ftp_cmd in auth_sequence():
-                sys.stdout.write(ftp_cmd)
-                control_channel.sendall(ftp_cmd.encode())
-                response = control_channel.recv(1024).decode()
-                formatted_resp, _ = process_response(response)
-                print(formatted_resp, end='')
-
-            valid_actions = ["CONNECT", "FETCH", "EXIT"]
-
-        elif action == "FETCH":
-            if not control_channel:
-                print("ERROR -- No FTP control connection established")
-                continue
-            result = validate_fetch(user_input)
-            if isinstance(result, tuple):
-                response_msg, path = result
-                print(response_msg, end='')
-            else:
-                print(result)
-                continue
-            control_channel, data_port, file_count = handle_transfer(
-                control_channel, data_port, parts[1], file_count)
-
-        elif action == "EXIT":
-            result = validate_exit(user_input)
-            print(result, end='')
-            end_session(control_channel)
-            control_channel.close()
-            sys.exit(0)
+def process_connect(ftp_control_connection):
+    pass
 
 
-def handle_transfer(conn, port_val, path, count):
+def process_get(ftp_control_connection, welcoming_port, file_path, num_copied_files):
     try:
-        data_link = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        data_link.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        data_link.bind(('', port_val))
-        data_link.listen(1)
-    except Exception:
-        print("FETCH failed, FTP-data port not allocated.")
-        return conn, port_val, count
+        data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        data_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        data_socket.bind(('', welcoming_port))
+        data_socket.listen(1)
+    except Exception as e:
+        print("GET failed, FTP-data port not allocated.")
+        return ftp_control_connection, welcoming_port, num_copied_files
 
-    cmd_list = build_transfer_cmds(port_val, path)
-    final_resp = ""
-    for ftp_cmd in cmd_list:
-        sys.stdout.write(ftp_cmd)
-        conn.sendall(ftp_cmd.encode())
-        response = conn.recv(1024).decode()
-        formatted_resp, _ = process_response(response)
-        print(formatted_resp, end='')
-        if ftp_cmd.startswith("RETR"):
-            final_resp = response
-            if final_resp.startswith("150"):
-                end_resp = conn.recv(1024).decode()
-                formatted_end, _ = process_response(end_resp)
-                print(formatted_end, end='')
 
-    if final_resp.startswith("550"):
-        data_link.close()
-        port_val += 1
-        return conn, port_val, count
+    get_commands = generate_get_output(welcoming_port, file_path)
+    retr_reply = ""
+    retr_reply = ""
+    for cmd in get_commands:
+        sys.stdout.write(cmd)
+        ftp_control_connection.sendall(cmd.encode())
+        reply = ftp_control_connection.recv(1024).decode()
+        parsed_reply, _ = parse_reply(reply)
+        print(parsed_reply, end='')
+        if cmd.startswith("RETR"):
+            retr_reply = reply
+            if retr_reply.startswith("150"):
+                final_reply = ftp_control_connection.recv(1024).decode()
+                parsed_final, _ = parse_reply(final_reply)
+                print(parsed_final, end='')
+
+
+
+    if retr_reply.startswith("550"):
+        data_socket.close()
+        welcoming_port += 1
+        return ftp_control_connection, welcoming_port, num_copied_files
+
 
     try:
-        transfer_link, addr = data_link.accept()
-    except Exception:
-        print("ERROR -- Unable to accept FTP-data connection")
-        data_link.close()
-        port_val += 1
-        return conn, port_val, count
+        conn, addr = data_socket.accept()
+    except Exception as e:
+        print("ERROR -- Unable to accept FTP-data connection:", e)
+        data_socket.close()
+        welcoming_port += 1
+        return ftp_control_connection, welcoming_port, num_copied_files
+
 
     if not os.path.exists("retr_files"):
         os.mkdir("retr_files")
-    count += 1
-    new_file = os.path.join("retr_files", f"file{count}")
+    num_copied_files += 1
+    filename = os.path.join("retr_files", f"file{num_copied_files}")
 
-    with open(new_file, "wb") as f:
+    with open(filename, "wb") as f:
         while True:
-            chunk = transfer_link.recv(1024)
-            if not chunk:
+            data = conn.recv(1024)
+            if not data:
                 break
-            f.write(chunk)
-    transfer_link.close()
-    data_link.close()
-    port_val += 1
-    return conn, port_val, count
+            f.write(data)
+    conn.close()
+    data_socket.close()
+    welcoming_port += 1
+    return ftp_control_connection, welcoming_port, num_copied_files
 
 
-def end_session(conn):
-    if not conn:
-        return
-    exit_cmd = "EXIT\r\n"
-    sys.stdout.write(exit_cmd)
-    conn.sendall(exit_cmd.encode())
-    response = conn.recv(1024).decode()
-    formatted_resp, _ = process_response(response)
-    print(formatted_resp, end='')
+def process_quit(ftp_control_connection):
+    quit_cmd = "QUIT\r\n"
+    sys.stdout.write(quit_cmd)
+    ftp_control_connection.sendall(quit_cmd.encode())
+    reply = ftp_control_connection.recv(1024).decode()
+    parsed_reply, _ = parse_reply(reply)
+    print(parsed_reply, end='')
 
 
-def auth_sequence():
-    return ["USER anonymous\r\n", "PASS guest@\r\n", "SYST\r\n", "TYPE I\r\n"]
+def generate_connect_output():
+    connect_commands = ["USER anonymous\r\n",
+                        "PASS guest@\r\n",
+                        "SYST\r\n",
+                        "TYPE I\r\n"]
+    return connect_commands
 
 
-def build_transfer_cmds(port_val, path):
-    local_ip = socket.gethostbyname(socket.gethostname())
-    ip_parts = local_ip.split('.')
-    upper = port_val // 256
-    lower = port_val % 256
-    port_spec = ",".join(ip_parts + [str(upper), str(lower)])
-    return [f"PORT {port_spec}\r\n", f"RETR {path}\r\n"]
+def generate_get_output(port_num, file_path):
+    client_ip = socket.gethostbyname(socket.gethostname())
+    ip_parts = client_ip.split('.')
+    high = port_num // 256
+    low = port_num % 256
+    host_port = ",".join(ip_parts + [str(high), str(low)])
+    port_cmd = f"PORT {host_port}\r\n"
+    retr_cmd = f"RETR {file_path}\r\n"
+    return [port_cmd, retr_cmd]
+
+def parse_connect(command):
+    server_host = ""
+    server_port = -1
 
 
-def check_connection(cmd):
-    hostname = ""
-    port_num = -1
-    if cmd[:7].upper() != "CONNECT" or len(cmd) == 7:
-        return "ERROR -- request", port_num, hostname
-    cmd = cmd[7:].lstrip()
+    if command[0:7].upper() != "CONNECT" or len(command) == 7:
+        return "ERROR -- request", server_port, server_host
+    command = command[7:]
 
-    cmd = check_whitespace(cmd)
-    if len(cmd) > 1:
-        cmd, hostname = get_host(cmd)
+    command = parse_space(command)
+    if len(command) > 1:
+        command, server_host = parse_server_host(command)
     else:
-        cmd = "ERROR -- server-host"
+        command = "ERROR -- server-host"
 
-    if "ERROR" in cmd:
-        return cmd, port_num, hostname
 
-    cmd = check_whitespace(cmd)
-    if len(cmd) > 1:
-        cmd, port_num = get_port(cmd)
+    if "ERROR" in command:
+        return command, server_port, server_host
+
+
+    command = parse_space(command)
+    if len(command) > 1:
+        command, server_port = parse_server_port(command)
     else:
-        cmd = "ERROR -- server-port"
-
-    port_num = int(port_num)
-    if "ERROR" in cmd:
-        return cmd, port_num, hostname
-    if cmd.strip():
-        return "ERROR -- <CRLF>", port_num, hostname
-    return f"CONNECT accepted for FTP server at host {hostname} and port {port_num}\r\n", port_num, hostname
+        command = "ERROR -- server-port"
 
 
-def validate_fetch(cmd):
-    if cmd[:3].upper() != "FETCH":
+    server_port = int(server_port)
+
+    if "ERROR" in command:
+        return command, server_port, server_host
+    elif command != '\r\n' and command != '\n':
+        return "ERROR -- <CRLF>", server_port, server_host
+    return f"CONNECT accepted for FTP server at host {server_host} and port {server_port}\r\n", server_port, server_host
+
+
+def parse_get(command):
+    if command[0:3].upper() != "GET":
         return "ERROR -- request"
-    cmd = cmd[3:].lstrip()
+    command = command[3:]
 
-    cmd = check_whitespace(cmd)
-    cmd, path = check_path(cmd)
+    command = parse_space(command)
+    command, pathname = parse_pathname(command)
 
-    if "ERROR" in cmd:
-        return cmd
-    if cmd.strip():
+
+    if "ERROR" in command:
+        return command
+    elif command != '\r\n' and command != '\n':
         return "ERROR -- <CRLF>"
-    return f"FETCH accepted for {path}\r\n", path
+    return f"GET accepted for {pathname}\r\n", pathname
 
 
-def validate_exit(cmd):
-    if cmd.upper() not in ["EXIT\r\n", "EXIT\n"]:
+def parse_quit(command):
+    if command.upper() != "QUIT\r\n" and command.upper() != "QUIT\n":
         return "ERROR -- <CRLF>"
-    return "EXIT accepted, terminating FTP client\r\n"
+    else:
+        return "QUIT accepted, terminating FTP client\r\n"
 
 
-def get_host(s):
-    s, host = parse_domain(s)
-    return s, host
+def parse_server_host(command):
+    command, server_host = parse_domain(command)
+    if command == "ERROR":
+        return "ERROR -- server-host", server_host
+    else:
+        return command, server_host
 
 
-def get_port(s):
-    digits = []
-    port_str = ""
-    for c in s:
-        if ord(c) >= char_map["0"] and ord(c) <= char_map["9"]:
-            digits.append(c)
-            port_str += c
+def parse_server_port(command):
+    port_nums = []
+    port_string = ""
+    for char in command:
+        if ord(char) >= ASCII["0"] and ord(char) <= ASCII["9"]:
+            port_nums.append(char)
+            port_string += char
         else:
             break
-    if len(digits) < 5:
-        if digits and digits[0] == '0' and len(digits) > 1:
+    if len(port_nums) < 5:
+        if ord(port_nums[0]) == ASCII["0"] and len(port_nums) > 1:
             return "ERROR -- server-port"
-        return s[len(digits):], port_str
-    elif len(digits) == 5:
-        if digits[0] == '0' or int(s[:5]) > 65535:
+        return command[len(port_nums):], port_string
+    elif len(port_nums) == 5:
+        if ord(port_nums[0]) == ASCII["0"] or  int(command[0:5]) > 65535:
             return "ERROR -- server-port"
-    return s[len(digits):], port_str
+    return command[len(port_nums):], port_string
 
 
-def check_path(s):
-    path = ""
-    if s[:2] in ['\r\n', '\n']:
-        return "ERROR -- pathname", path
-
-    while len(s) > 1:
-        if s[:2] == '\r\n':
-            return s, path
-        if ord(s[0]) < char_map["min_val"] or ord(s[0]) > char_map["max_val"]:
-            return "ERROR -- pathname", path
-        path += s[0]
-        s = s[1:]
-    return s, path
-
-
-def parse_domain(s):
-    s, domain = parse_domain_part(s)
-    return s, domain
+def parse_pathname(command):
+    pathname = ""
+    if command[0] == '\n' or command[0:2] == '\r\n':
+        return "ERROR -- pathname", pathname
+    else:
+        while len(command) > 1:
+            if len(command) == 2 and command[0:2] == '\r\n':
+                return command, pathname
+            elif ord(command[0]) >= ASCII["min_ascii_val"] and ord(command[0]) <= ASCII["max_ascii_val"]:
+                pathname += command[0]
+                command = command[1:]
+            else:
+                return "ERROR -- pathname", pathname
+        return command, pathname
 
 
-def parse_domain_part(s, current=""):
-    if s and s[0].isalpha():
-        current += s[0]
-        s, sub = parse_alnum(s[1:])
-        current += sub
-        if s and s[0] == '.':
-            return parse_domain_part(s[1:], current + '.')
-        elif s and s[0] == ' ':
-            return s, current
+# <domain> ::= <element> | <element>"."<domain>
+def parse_domain(command):
+    command, server_host = parse_element(command)
+    return command, server_host
+
+
+# <element> ::= <a><let-dig-hyp-str>
+def parse_element(command, element_string=""):
+
+    if (ord(command[0]) >= ASCII["A"] and ord(command[0]) <= ASCII["Z"]) \
+            or (ord(command[0]) >= ASCII["a"] and ord(command[0]) <= ASCII["z"]):
+        element_string += command[0]
+        command, let_dig_string = parse_let_dig_str(command[1:])
+        element_string += let_dig_string
+        if command[0] == ".":
+            element_string += "."
+            return parse_element(command[1:], element_string)
+        elif command[0] == ' ':
+            return command, element_string
         else:
-            return "ERROR", current
-    elif s.startswith(' '):
-        return s, current
-    return "ERROR", current
+            return "ERROR", element_string
+    elif command[0] == ' ':
+        return command, element_string
+    return "ERROR", element_string
 
+def parse_let_dig_str(command):
+    let_dig_string = ""
+    while (ord(command[0]) >= ASCII["A"] and ord(command[0]) <= ASCII["Z"]) \
+            or (ord(command[0]) >= ASCII["a"] and ord(command[0]) <= ASCII["z"]) \
+            or (ord(command[0]) >= ASCII["0"] and ord(command[0]) <= ASCII["9"]) \
+            or (ord(command[0]) == ord('-')):
+        let_dig_string += command[0]
+        if len(command) > 1:
+            command = command[1:]
+        else:
+            return command, let_dig_string
+    return command, let_dig_string
 
-def parse_alnum(s):
-    valid_chars = ""
-    while s and (s[0].isalnum() or s[0] == '-'):
-        valid_chars += s[0]
-        s = s[1:]
-    return s, valid_chars
-
-
-def check_whitespace(s):
-    if not s.startswith(' '):
+def parse_space(line):
+    if line[0] != ' ':
         return "ERROR"
-    return s.lstrip(' ')
+    while line[0] == ' ':
+        line = line[1:]
+    return line
+
+def parse_reply(reply):
+    reply, reply_code = parse_reply_code(reply)
+    if "ERROR" in reply:
+        return reply, reply_code
+
+    reply = parse_space(reply)
+    if "ERROR" in reply:
+        return "ERROR -- reply-code", reply_code
+
+    reply, reply_text = parse_reply_text(reply)
+    if "ERROR" in reply:
+        return reply, reply_code
+
+    if reply != '\r\n' and reply != '\n':
+        return "ERROR -- <CRLF>", reply_code
+    return f"FTP reply {reply_code} accepted. Text is: {reply_text}\r\n", reply_code
 
 
-def process_response(resp):
-    resp, code = get_code(resp)
-    if "ERROR" in resp:
-        return resp, code
-
-    resp = check_whitespace(resp)
-    if "ERROR" in resp:
-        return "ERROR -- reply-code", code
-
-    resp, text = get_text(resp)
-    if "ERROR" in resp:
-        return resp, code
-
-    if resp not in ['\r\n', '\n']:
-        return "ERROR -- <CRLF>", code
-    return f"FTP reply {code} accepted. Text is: {text}\r\n", code
+def parse_reply_code(reply):
+    reply, reply_code = parse_reply_number(reply)
+    if "ERROR" in reply:
+        return "ERROR -- reply-code", reply_code
+    return reply, reply_code
 
 
-def get_code(resp):
-    if len(resp) < 3:
-        return "ERROR", ""
+def parse_reply_number(reply):
+    reply_number = 0
+    if len(reply) < 3:
+        return "ERROR", reply_number
     try:
-        code = int(resp[:3])
+        reply_number = int(reply[0:3])
     except ValueError:
-        return "ERROR", ""
-    if not 100 <= code <= 599:
-        return "ERROR", ""
-    return resp[3:], str(code)
+        return "ERROR", reply_number
+    reply_number = reply[0:3]
+    if int(reply_number) < 100 or int(reply_number) > 599:
+        return "ERROR", reply_number
+    return reply[3:], reply_number
 
 
-def get_text(resp):
-    text = ""
-    if resp[:2] in ['\r\n', '\n']:
-        return "ERROR -- reply_text", text
-
-    while resp and resp not in ['\r\n', '\n']:
-        if ord(resp[0]) < 0 or ord(resp[0]) > 127:
-            return "ERROR -- reply_text", text
-        text += resp[0]
-        resp = resp[1:]
-    return resp, text
+def parse_reply_text(reply):
+    reply_text = ""
+    if reply[0] == '\n' or reply[0:2] == '\r\n':
+        return "ERROR -- reply_text", reply_text
+    else:
+        while len(reply) > 1:
+            if len(reply) == 2 and reply[0:2] == '\r\n':
+                return reply, reply_text
+            elif ord(reply[0]) >= ASCII["min_ascii_val"] and ord(reply[0]) <= ASCII["max_ascii_val"]:
+                reply_text += reply[0]
+                reply = reply[1:]
+            else:
+                return "ERROR -- reply_text", reply_text
+        return reply, reply_text
 
 
 if __name__ == "__main__":
-    execute_commands()
+    read_commands()
+
+
+

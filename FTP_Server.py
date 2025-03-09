@@ -14,153 +14,153 @@ NOOP_REGEX = re.compile(r'^NOOP\r\n$', re.IGNORECASE)
 
 class FTPServer:
     def __init__(self):
-        self.is_authenticated = False
-        self.user_provided = False
-        self.quit_called = False
-        self.port_configured = False
-        self.current_user = None
-        self.file_transfer_count = 0
-        self.transfer_dir = "retr_files"
-        os.makedirs(self.transfer_dir, exist_ok=True)
+        self.logged_in = False
+        self.user_received = False
+        self.quit_received = False
+        self.port_set = False
+        self.last_username = None
+        self.retr_count = 0
+        self.retr_directory = "retr_files"
+        os.makedirs(self.retr_directory, exist_ok=True)
 
-    def process_command(self, cmd_input, connection):
-        print(cmd_input, end="")
+    def parse_ftp_command(self, ftp_input_data, conn):
+        print(ftp_input_data, end="")
 
-        if cmd_input[0].isspace():
-            self.user_provided = False
+        if ftp_input_data[0].isspace():
+            self.user_received = False
             return "500 Syntax error, command unrecognized.\r\n"
 
-        tokens = cmd_input.strip().split(maxsplit=1)
-        cmd = tokens[0].upper() if tokens else ""
-        args = tokens[1] if len(tokens) > 1 else ""
+        parts = ftp_input_data.strip().split(maxsplit=1)
+        command = parts[0].upper() if parts else ""
+        params = parts[1] if len(parts) > 1 else ""
 
-        if cmd.strip() == "QUIT":
-            self.quit_called = True
+        if command.strip() == "QUIT":
+            self.quit_received = True
             return "221 Goodbye.\r\n"
 
-        if cmd in ["USER", "PASS", "TYPE", "RETR", "PORT", "SYST", "NOOP"]:
-            if cmd == "USER":
-                m = USER_REGEX.match(cmd_input)
-                if m:
-                    self.user_provided = True
-                    self.is_authenticated = False
-                    self.port_configured = False
-                    self.current_user = m.group(2)
+        if command in ["USER", "PASS", "TYPE", "RETR", "PORT", "SYST", "NOOP"]:
+            if command == "USER":
+                match = USER_REGEX.match(ftp_input_data)
+                if match:
+                    self.user_received = True
+                    self.logged_in = False
+                    self.port_set = False
+                    self.last_username = match.group(2)
                     return "331 Guest access OK, send password.\r\n"
-                self.user_provided = False
-                self.is_authenticated = False
+                self.user_received = False
+                self.logged_in = False
                 return "501 Syntax error in parameter.\r\n"
 
-            if cmd == "PASS":
-                if not self.user_provided:
-                    self.is_authenticated = False
+            if command == "PASS":
+                if not self.user_received:
+                    self.logged_in = False
                     return "503 Bad sequence of commands.\r\n"
-                m = PASS_REGEX.match(cmd_input)
-                if m:
-                    self.user_provided = False
-                    self.is_authenticated = True
+                match = PASS_REGEX.match(ftp_input_data)
+                if match:
+                    self.user_received = False
+                    self.logged_in = True
                     return "230 Guest login OK.\r\n"
                 return "501 Syntax error in parameter.\r\n"
 
-            if self.is_authenticated:
-                if cmd == "TYPE":
-                    if (m := TYPE_REGEX.match(cmd_input)):
-                        return f"200 Type set to {m.group(1).upper()}.\r\n"
+            if self.logged_in:
+                if command == "TYPE":
+                    if (match := TYPE_REGEX.match(ftp_input_data)):
+                        return f"200 Type set to {match.group(1).upper()}.\r\n"
                     return "501 Syntax error in parameter.\r\n"
 
-                if cmd == "SYST":
-                    if (m := SYST_REGEX.match(cmd_input)):
+                if command == "SYST":
+                    if (match := SYST_REGEX.match(ftp_input_data)):
                         return "215 UNIX Type: L8.\r\n"
                     return "501 Syntax error in parameter.\r\n"
 
-                if cmd == "NOOP":
-                    if (m := NOOP_REGEX.match(cmd_input)):
+                if command == "NOOP":
+                    if (match := NOOP_REGEX.match(ftp_input_data)):
                         return "200 Command OK.\r\n"
                     return "501 Syntax error in parameter.\r\n"
 
-                if cmd == "PORT":
-                    if (m := PORT_REGEX.match(cmd_input)):
-                        self.data_ip = '.'.join(m.group(1, 2, 3, 4))
-                        self.data_port = (int(m.group(5)) * 256) + int(m.group(6))
-                        self.port_configured = True
-                        return f"200 Port command successful ({self.data_ip},{self.data_port}).\r\n"
+                if command == "PORT":
+                    if (match := PORT_REGEX.match(ftp_input_data)):
+                        self.client_ip = '.'.join(match.group(1, 2, 3, 4))
+                        self.client_port = (int(match.group(5)) * 256) + int(match.group(6))
+                        self.port_set = True
+                        return f"200 Port command successful ({self.client_ip},{self.client_port}).\r\n"
                     return "501 Syntax error in parameter.\r\n"
 
-                if cmd == "RETR":
-                    if (m := RETR_REGEX.match(cmd_input)):
-                        if not self.port_configured:
+                if command == "RETR":
+                    if (match := RETR_REGEX.match(ftp_input_data)):
+                        if not self.port_set:
                             return "503 Bad sequence of commands.\r\n"
-                        if not args or not os.path.isfile(args):
+                        if not params or not os.path.isfile(params):
                             return "550 File not found or access denied.\r\n"
 
-                        self.file_transfer_count += 1
-                        filename = f"file{self.file_transfer_count}"
-                        target_path = os.path.join(self.transfer_dir, filename)
+                        self.retr_count += 1
+                        new_filename = f"file{self.retr_count}"
+                        destination_path = os.path.join(self.retr_directory, new_filename)
 
-                        connection.sendall("150 File status okay.\r\n".encode())
-                        print("150 File status okay.\r\n", end="")
+                        conn.sendall("150 File status okay.\r\n".encode())
+                        print("150 File status okay.\r\n", end="")  # This goes to the server log.
                         try:
-                            data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            data_socket.settimeout(10)
-                            data_socket.connect((self.data_ip, self.data_port))
-                            with open(args, "rb") as f:
+                            data_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            data_conn.settimeout(10)
+                            data_conn.connect((self.client_ip, self.client_port))
+                            with open(params, "rb") as f:
                                 while True:
                                     chunk = f.read(1024)
                                     if not chunk:
                                         break
-                                    data_socket.sendall(chunk)
-                            data_socket.close()
-                            self.port_configured = False
+                                    data_conn.sendall(chunk)
+                            data_conn.close()  # Only close after sending all data.
+                            self.port_set = False
                             return "250 Requested file action completed.\r\n"
                         except Exception as e:
-                            self.port_configured = False
+                            self.port_set = False
                             return "425 Can not open data connection.\r\n"
 
                     return "501 Syntax error in parameter.\r\n"
 
-            self.user_provided = False
+            self.user_received = False
             return "530 Not logged in.\r\n"
 
-        self.user_provided = False
+        self.user_received = False
         return "500 Syntax error, command unrecognized.\r\n"
 
-    def start(self, port):
-        main_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        main_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        main_socket.bind(('', port))
-        main_socket.listen(1)
+    def run(self, listen_port):
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(('', listen_port))
+        server_socket.listen(1)
 
         while True:
-            client_conn, client_address = main_socket.accept()
-            welcome_msg = "220 COMP 431 FTP server ready.\r\n"
-            print(welcome_msg, end="")
-            client_conn.sendall(welcome_msg.encode())
+            conn, addr = server_socket.accept()
+            greeting = "220 COMP 431 FTP server ready.\r\n"
+            print(greeting, end="")
+            conn.sendall(greeting.encode())
 
-            self.is_authenticated = False
-            self.user_provided = False
-            self.quit_called = False
-            self.port_configured = False
-            self.current_user = None
-            self.file_transfer_count = 0
+            self.logged_in = False
+            self.user_received = False
+            self.quit_received = False
+            self.port_set = False
+            self.last_username = None
+            self.retr_count = 0
 
             while True:
                 try:
-                    incoming_data = client_conn.recv(1024).decode()
-                    if not incoming_data:
+                    ftp_input_data = conn.recv(1024).decode()
+                    if not ftp_input_data:
                         break
 
-                    response = self.process_command(incoming_data, client_conn)
+                    response = self.parse_ftp_command(ftp_input_data, conn)
                     print(response, end="")
-                    client_conn.sendall(response.encode())
+                    conn.sendall(response.encode())
 
-                    if incoming_data.upper().startswith("QUIT"):
+                    if ftp_input_data.upper().startswith("QUIT"):
                         break
 
                 except Exception as e:
                     print("Error:", e)
                     break
 
-            client_conn.close()
+            conn.close()
 
 
 if __name__ == "__main__":
@@ -168,6 +168,6 @@ if __name__ == "__main__":
         print("Usage: python3 FTP_Server.py <port>")
         sys.exit(1)
 
-    server_port = int(sys.argv[1])
-    ftp_server = FTPServer()
-    ftp_server.start(server_port)
+    listen_port = int(sys.argv[1])
+    server = FTPServer()
+    server.run(listen_port)
