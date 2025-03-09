@@ -3,150 +3,268 @@ import os
 import socket
 import re
 
+ASCII_VALS = {
+    "A": ord("A"), "Z": ord("Z"), "a": ord("a"), "z": ord("z"),
+    "0": ord("0"), "9": ord("9"), "min": 0, "max": 127
+}
+
+USER_REGEX = re.compile(r'^\s*(USER)\s+([^\r\n ][\x00-\x7F]*)\r\n$', re.I)
+PASS_REGEX = re.compile(r'^\s*(PASS)\s+([^\r\n ][\x00-\x7F]*)\r\n$', re.I)
+TYPE_REGEX = re.compile(r'^TYPE\s+(A|I)\r\n$', re.I)
+RETR_REGEX = re.compile(r'^RETR\s+(.+)\r\n$', re.I)
+PORT_REGEX = re.compile(r'^PORT\s+(\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\r\n$', re.I)
+SYST_REGEX = re.compile(r'^SYST\r\n$', re.I)
+NOOP_REGEX = re.compile(r'^NOOP\r\n$', re.I)
+
 
 class FTPClient:
     def __init__(self):
-        self.control_sock = None
-        self.data_port = int(sys.argv[1])  # Initial welcoming port
-        self.transfer_count = 0
-        self.expected_cmds = ["CONNECT"]
-        self.connected = False
+        self.control = None
+        self.allowed = ["CONNECT"]
+        self.port = int(sys.argv[1])
+        self.file_count = 0
 
-    # ------------------------- Main Command Loop -------------------------
-    def run(self):
-        for line in sys.stdin:
-            line = line if '\r\n' in line else line.rstrip() + '\r\n'
-            sys.stdout.write(line)
-            cmd = line.strip().upper()
-            if not cmd:
+    def start(self):
+        for cmd in sys.stdin:
+            sys.stdout.write(cmd)
+            parts = cmd.strip().split()
+            if not parts:
                 continue
 
-            if cmd.startswith("CONNECT"):
-                self.handle_connect(line)
-            elif cmd.startswith("GET"):
-                self.handle_get(line) if self.connected else self.print_error("No control connection")
-            elif cmd.startswith("QUIT"):
-                self.handle_quit()
-            else:
+            action = parts[0].upper()
+            if action not in self.allowed:
                 print("ERROR -- Command Unexpected/Unknown")
+                continue
 
-    # ------------------------- Command Handlers --------------------------
-    def handle_connect(self, cmd):
-        host, port, err = self.parse_connect(cmd)
-        if err:
-            print(err)
-            return
+            if action == "CONNECT":
+                msg, s_port, host = self.handle_connect(cmd)
+                if "ERROR" in msg:
+                    print(msg)
+                    continue
+                print(msg, end='')
 
-        if self.control_sock:
-            self.send_quit()
+                if self.control:
+                    self.do_quit()
+                    self.control.close()
+                    self.control = None
 
-        try:
-            self.control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.control_sock.connect((host, port))
-            print(f"CONNECT accepted for FTP server at host {host} and port {port}\r\n", end='')
-            self.read_greeting()
-            self.send_login()
-            self.connected = True
-            self.expected_cmds = ["CONNECT", "GET", "QUIT"]
-        except Exception:
-            print("CONNECT failed")
-            self.connected = False
+                try:
+                    self.control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.control.connect((host, s_port))
+                except:
+                    print("CONNECT failed")
+                    self.control = None
+                    continue
 
-    def handle_get(self, cmd):
-        path, err = self.parse_get(cmd)
-        if err:
-            print(err)
-            return
+                reply = self.control.recv(1024).decode()
+                p_reply, _ = self.parse_response(reply)
+                print(p_reply, end='')
 
+                for ftp_cmd in self.auth_sequence():
+                    sys.stdout.write(ftp_cmd)
+                    self.control.sendall(ftp_cmd.encode())
+                    resp = self.control.recv(1024).decode()
+                    pr, _ = self.parse_response(resp)
+                    print(pr, end='')
+
+                self.allowed = ["CONNECT", "GET", "QUIT"]
+
+            elif action == "GET":
+                if not self.control:
+                    print("ERROR -- No FTP control connection established")
+                    continue
+                res = self.parse_get_cmd(cmd)
+                if isinstance(res, tuple):
+                    response, fpath = res
+                    print(response, end='')
+                else:
+                    print(res)
+                    continue
+                self.control, self.port, self.file_count = self.transfer_file(
+                    self.control, self.port, parts[1], self.file_count)
+
+            elif action == "QUIT":
+                res = self.parse_quit_cmd(cmd)
+                print(res, end='')
+                self.do_quit()
+                self.control.close()
+                sys.exit(0)
+
+    def auth_sequence(self):
+        return ["USER anonymous\r\n", "PASS guest@\r\n",
+                "SYST\r\n", "TYPE I\r\n"]
+
+    def transfer_file(self, conn, port_num, fpath, count):
         try:
             data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            data_sock.bind(('', self.data_port))
+            data_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            data_sock.bind(('', port_num))
             data_sock.listen(1)
-            self.send_port_cmd()
-            self.send_retr_cmd(path)
-            self.accept_data_connection(data_sock)
-            self.data_port += 1  # Increment for next GET
-        except Exception as e:
-            print(f"GET failed, {str(e)}\r")
+        except:
+            print("GET failed, FTP-data port not allocated.")
+            return conn, port_num, count
 
-    def handle_quit(self):
-        self.send_quit()
-        self.control_sock.close()
-        sys.exit(0)
+        cmds = self.port_retr_commands(port_num, fpath)
+        final = ""
+        for c in cmds:
+            sys.stdout.write(c)
+            conn.sendall(c.encode())
+            reply = conn.recv(1024).decode()
+            pr, _ = self.parse_response(reply)
+            print(pr, end='')
+            if c.startswith("RETR"):
+                final = reply
+                if final.startswith("150"):
+                    fr = conn.recv(1024).decode()
+                    pfr, _ = self.parse_response(fr)
+                    print(pfr, end='')
 
-    # ------------------------- Protocol Logic --------------------------
-    def read_greeting(self):
-        reply = self.control_sock.recv(1024).decode()
-        self.parse_and_print_reply(reply)
+        if final.startswith("550"):
+            data_sock.close()
+            port_num += 1
+            return conn, port_num, count
 
-    def send_login(self):
-        for cmd in ['USER anonymous\r\n', 'PASS guest@\r\n', 'SYST\r\n', 'TYPE I\r\n']:
-            self.control_sock.sendall(cmd.encode())
-            sys.stdout.write(cmd)
-            reply = self.control_sock.recv(1024).decode()
-            self.parse_and_print_reply(reply)
+        try:
+            d_conn, addr = data_sock.accept()
+        except:
+            print("ERROR -- Unable to accept FTP-data connection")
+            data_sock.close()
+            port_num += 1
+            return conn, port_num, count
 
-    def send_port_cmd(self):
-        ip = socket.gethostbyname(socket.gethostname()).replace('.', ',')
-        p1, p2 = self.data_port // 256, self.data_port % 256
-        port_cmd = f"PORT {ip},{p1},{p2}\r\n"
-        self.control_sock.sendall(port_cmd.encode())
-        sys.stdout.write(port_cmd)
-        self.parse_and_print_reply(self.control_sock.recv(1024).decode())
+        if not os.path.exists("retr_files"):
+            os.mkdir("retr_files")
+        count += 1
+        new_file = os.path.join("retr_files", f"file{count}")
 
-    def send_retr_cmd(self, path):
-        retr_cmd = f"RETR {path}\r\n"
-        self.control_sock.sendall(retr_cmd.encode())
-        sys.stdout.write(retr_cmd)
-        reply = self.control_sock.recv(1024).decode()
-        self.parse_and_print_reply(reply)
-        if reply.startswith('150'):
-            self.parse_and_print_reply(self.control_sock.recv(1024).decode())
-
-    def accept_data_connection(self, sock):
-        conn, _ = sock.accept()
-        os.makedirs("retr_files", exist_ok=True)
-        self.transfer_count += 1
-        with open(f"retr_files/file{self.transfer_count}", 'wb') as f:
+        with open(new_file, "wb") as f:
             while True:
-                data = conn.recv(1024)
-                if not data:
+                chunk = d_conn.recv(1024)
+                if not chunk:
                     break
-                f.write(data)
-        conn.close()
+                f.write(chunk)
+        d_conn.close()
+        data_sock.close()
+        port_num += 1
+        return conn, port_num, count
 
-    # ------------------------- Parsers --------------------------
-    def parse_connect(self, cmd):
-        cmd_parts = cmd[len("CONNECT"):].strip().split()
-        if len(cmd_parts) < 2 or not self.validate_host(cmd_parts[0]) or not self.validate_port(cmd_parts[1]):
-            return None, None, "ERROR -- Invalid CONNECT parameters\r\n"
-        return cmd_parts[0], int(cmd_parts[1]), None
+    def do_quit(self):
+        if not self.control:
+            return
+        cmd = "QUIT\r\n"
+        sys.stdout.write(cmd)
+        self.control.sendall(cmd.encode())
+        resp = self.control.recv(1024).decode()
+        pr, _ = self.parse_response(resp)
+        print(pr, end='')
 
-    def parse_get(self, cmd):
-        if len(cmd.split()) < 2 or any(ord(c) > 127 for c in cmd.split()[1]):
-            return None, "ERROR -- Invalid pathname\r\n"
-        return cmd.split()[1], None
+    def port_retr_commands(self, port, path):
+        ip = socket.gethostbyname(socket.gethostname())
+        ip_parts = ip.split('.')
+        hi = port // 256
+        lo = port % 256
+        port_cmd = f"PORT {','.join(ip_parts + [str(hi), str(lo)])}\r\n"
+        return [port_cmd, f"RETR {path}\r\n"]
 
-    def validate_host(self, host):
-        return re.match(r'^([a-zA-Z0-9-]+\.)*[a-zA-Z0-9-]+$', host)
+    def handle_connect(self, cmd):
+        host, port = "", -1
+        if cmd[:7].upper() != "CONNECT" or len(cmd) == 7:
+            return "ERROR -- request", port, host
+        cmd = cmd[7:].lstrip()
 
-    def validate_port(self, port):
-        return port.isdigit() and 0 <= int(port) <= 65535 and (len(port) == 1 or port[0] != '0')
+        cmd, host = self.get_host(cmd)
+        if "ERROR" in cmd:
+            return cmd, port, host
 
-    def parse_and_print_reply(self, reply):
-        code = reply[:3]
-        text = reply[4:].strip()
-        print(f"FTP reply {code} accepted. Text is: {text}\r\n", end='')
+        cmd = cmd.lstrip()
+        cmd, port = self.get_port(cmd)
+        port = int(port)
 
-    def print_error(self, msg):
-        print(f"ERROR -- {msg}\r")
+        if "ERROR" in cmd:
+            return cmd, port, host
+        if cmd.strip():
+            return "ERROR -- <CRLF>", port, host
+        return f"CONNECT accepted for FTP server at host {host} and port {port}\r\n", port, host
 
-    def send_quit(self):
-        self.control_sock.sendall(b'QUIT\r\n')
-        sys.stdout.write("QUIT\r\n")
-        self.parse_and_print_reply(self.control_sock.recv(1024).decode())
+    def get_host(self, cmd):
+        cmd, host = self.parse_domain(cmd)
+        return cmd, host
+
+    def get_port(self, cmd):
+        nums = []
+        for c in cmd:
+            if c.isdigit():
+                nums.append(c)
+            else:
+                break
+        if not nums:
+            return "ERROR -- server-port", ""
+        if len(nums) > 1 and nums[0] == '0':
+            return "ERROR -- server-port", ""
+        port = int(''.join(nums))
+        if port > 65535:
+            return "ERROR -- server-port", ""
+        return cmd[len(nums):], port
+
+    def parse_domain(self, s):
+        parts = []
+        while True:
+            if not s:
+                break
+            if s[0] == '.':
+                parts.append('.')
+                s = s[1:]
+            elif s[0].isalpha():
+                part = [s[0]]
+                s = s[1:]
+                while s and (s[0].isalnum() or s[0] == '-'):
+                    part.append(s[0])
+                    s = s[1:]
+                parts.append(''.join(part))
+            else:
+                break
+        if not parts:
+            return "ERROR", ""
+        return s, '.'.join(parts).rstrip('.')
+
+    def parse_get_cmd(self, cmd):
+        if cmd[:3].upper() != "GET":
+            return "ERROR -- request"
+        cmd = cmd[3:].lstrip()
+        path = cmd.split()[0]
+        if not path:
+            return "ERROR -- pathname"
+        remaining = cmd[len(path):].strip()
+        if remaining:
+            return "ERROR -- <CRLF>"
+        return f"GET accepted for {path}\r\n", path
+
+    def parse_quit_cmd(self, cmd):
+        if cmd.upper() not in ["QUIT\r\n", "QUIT\n"]:
+            return "ERROR -- <CRLF>"
+        return "QUIT accepted, terminating FTP client\r\n"
+
+    def parse_response(self, resp):
+        if len(resp) < 3:
+            return "ERROR -- reply-code", ""
+        code = resp[:3]
+        if not code.isdigit() or not (100 <= int(code) <= 599):
+            return "ERROR -- reply-code", ""
+        rest = resp[3:].lstrip()
+        text = []
+        while rest and rest not in ['\r\n', '\n']:
+            if ord(rest[0]) < 0 or ord(rest[0]) > 127:
+                return "ERROR -- reply-text", code
+            text.append(rest[0])
+            rest = rest[1:]
+        if rest not in ['\r\n', '\n']:
+            return "ERROR -- <CRLF>", code
+        return f"FTP reply {code} accepted. Text is: {''.join(text)}\r\n", code
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python3 FTP_Client.py <port>")
+        sys.exit(1)
     client = FTPClient()
-    client.run()
+    client.start()
